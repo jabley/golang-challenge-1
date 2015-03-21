@@ -15,8 +15,9 @@ import (
 // ErrNotSPLICE is returned if the stream is not a SPLICE format
 var ErrNotSPLICE = errors.New("Not a SPLICE stream")
 
-// frameHeaderLen is the number of bytes required to express the header
-const frameHeaderLen = 46
+// frameHeaderLen is the number of bytes required to express the header.
+// this does not include the magic marker
+const frameHeaderLen = 40
 
 type stickyErrReader struct {
 	r   io.Reader
@@ -63,13 +64,6 @@ func DecodeFile(path string) (*Pattern, error) {
 
 func newFramer(br *bufio.Reader) framer {
 	fr := framer{br: br}
-	fr.getReadBuf = func(size uint32) []byte {
-		if cap(fr.readBuf) >= int(size) {
-			return fr.readBuf[:size]
-		}
-		fr.readBuf = make([]byte, size)
-		return fr.readBuf
-	}
 	return fr
 }
 
@@ -78,41 +72,38 @@ func dump(data []byte) {
 }
 
 // +----------------------------------+
-// |MAGIC(48bits) | unused (32bits)   |
-// | Length(32bits) |
+// |MAGIC(48bits) |
+// | Length(64bits) |
 // +----------------------------------+
-// | Version (null-terminated)        |
+// | Version (null-terminated string, 256bits)        |
 // +----------------------------------+
 // |     track block                  |
 // |              ...                 |
 func (f *framer) readSplice() (*Pattern, error) {
-	magic, err := f.br.Peek(6)
+	// a working buffer
+	buf := make([]byte, 64)
 
-	if err != nil {
+	_, err := f.br.Read(buf[0:14])
+
+	// Do we have something that looks like a valid SPLICE stream?
+	if err != nil || !bytes.Equal(buf[0:6], []byte("SPLICE")) {
 		return nil, ErrNotSPLICE
 	}
 
-	if !bytes.Equal(magic[:6], []byte("SPLICE")) {
-		return nil, ErrNotSPLICE
-	}
+	// how big is the stream?
+	size := binary.BigEndian.Uint64(buf[6:14])
+	p := &Pattern{length: int64(size)}
 
-	// Read header
-	p, err := f.readFrameHeader(f.headerBuf[:], f.br)
-	if err != nil {
-		return nil, err
-	}
+	// Limit how many bytes we'll read from this stream
+	r := io.LimitReader(f.br, p.length)
 
-	// fmt.Printf("data length: %v\n", p.length)
-	data := f.getReadBuf(p.length - frameHeaderLen + 14)
+	// Read the version string, which is a null-terminated string
+	io.ReadFull(r, buf[0:32])
+	version := f.readNullTerminatedString(buf[0:32])
 
-	if _, err := io.ReadFull(f.br, data); err != nil {
-		fmt.Printf("Error slurping the data: %v\n", err)
-		return nil, err
-	}
-
-	version := f.readNullTerminatedString(f.headerBuf[14:])
-	tempo, err := f.readFloat32(data[0:4])
-
+	// Read the tempo, which is a little-endian float32
+	io.ReadFull(io.LimitReader(r, 4), buf[0:4])
+	tempo, err := f.readFloat32(buf[0:4])
 	if err != nil {
 		return nil, err
 	}
@@ -120,43 +111,13 @@ func (f *framer) readSplice() (*Pattern, error) {
 	p.Version = version
 	p.Tempo = tempo
 
-	pos := 4 // skip tempo bytes
+	err = f.readTracks(buf, r, p)
 
-	for pos < len(data) {
-		// fmt.Printf("Parsing track – pos: %v, size: %v\n", pos, len(data))
-		// dump(data[pos:])
-		id := int(data[pos])
-
-		// fmt.Printf("Reading track %v\n", id)
-		pos += 4 // single byte for ID, plus 3 unused
-		nameSize := int(data[pos])
-		pos++
-		name := string(data[pos : pos+nameSize])
-		pos += nameSize
-		// fmt.Printf("Parsed name %v\n", name)
-		steps := f.bitsToBools(data[pos : pos+16])
-		track := track{ID: strconv.Itoa(id), Name: name, Steps: steps}
-		// fmt.Printf("Parsed track %v\n", track)
-		p.Tracks = append(p.Tracks, track)
-		pos += 16
-		// fmt.Printf("Added a track\n")
-	}
-
-	return &p, nil
-}
-
-func (f *framer) readFrameHeader(buf []byte, r io.Reader) (Pattern, error) {
-	_, err := io.ReadFull(r, buf)
 	if err != nil {
-		return Pattern{}, err
+		return nil, err
 	}
 
-	length := f.readUint32(buf[10:14])
-
-	return Pattern{
-		length: length,
-	}, nil
-
+	return p, nil
 }
 
 // bitsToBools maps an array of bytes to an array of bools
@@ -168,14 +129,9 @@ func (f *framer) bitsToBools(buf []byte) []bool {
 	return res
 }
 
-func (f *framer) readUint32(b []byte) uint32 {
-	return binary.BigEndian.Uint32(b)
-}
-
 func (f *framer) readFloat32(b []byte) (float32, error) {
 	var res float32
-	buf := bytes.NewReader(b)
-	err := binary.Read(buf, binary.LittleEndian, &res)
+	err := binary.Read(bytes.NewReader(b), binary.LittleEndian, &res)
 	return res, err
 }
 
@@ -186,4 +142,37 @@ func (f *framer) readNullTerminatedString(buf []byte) string {
 		}
 	}
 	return ""
+}
+
+// +-----------+
+// | id(8bits) |
+// +----------------------------------+
+// | length (32bits)                  |
+// +----------------------------------+
+// | name (ascii string, length bytes)|
+// +----------------------------------+
+// | steps (128bits)                  |
+// +----------------------------------+
+func (f *framer) readTracks(buf []byte, r io.Reader, p *Pattern) error {
+	for {
+		_, err := r.Read(buf[0:1])
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+		id := int(buf[0])
+		// fmt.Printf("id: %v\n", id)
+		r.Read(buf[0:4])
+		nameLen := binary.BigEndian.Uint32(buf[0:4])
+		// fmt.Printf("name length: %v\n", nameLen)
+		r.Read(buf[0:nameLen])
+		name := string(buf[0:nameLen])
+		// fmt.Printf("name: %v\n", name)
+		r.Read(buf[0:16])
+		steps := f.bitsToBools(buf[0:16])
+		track := track{ID: strconv.Itoa(id), Name: name, Steps: steps}
+		p.Tracks = append(p.Tracks, track)
+	}
+	return nil
 }

@@ -10,7 +10,7 @@ type Pattern struct {
 	Version string
 	Tempo   float32
 	Tracks  []track
-	length  uint32
+	length  int64
 }
 
 func (p *Pattern) String() string {
