@@ -20,7 +20,6 @@ func (p *Pattern) String() string {
 		res += track.String()
 	}
 	return res
-
 }
 
 type track struct {
